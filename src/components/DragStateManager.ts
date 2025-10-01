@@ -11,8 +11,8 @@ export class DragStateManager {
   private controls: OrbitControls;
   private arrow!: THREE.ArrowHelper;
   private localHit: THREE.Vector3;
-  private worldHit: THREE.Vector3;
-  private currentWorld: THREE.Vector3;
+  public worldHit: THREE.Vector3;
+  public currentWorld: THREE.Vector3;
   private mouseDown: boolean;
 
   public active: boolean;

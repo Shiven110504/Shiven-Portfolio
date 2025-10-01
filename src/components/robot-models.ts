@@ -12,12 +12,12 @@ export const ROBOT_MODELS: Record<string, RobotModel> = {
   },
   unitree_go2: {
     name: 'Unitree Go2',
-    path: '/unitree_go2/go2.xml',
+    path: '/unitree_go2/scene.xml',
     description: 'Quadruped robot'
   },
   unitree_h1: {
     name: 'Unitree H1',
-    path: '/unitree_h1/h1.xml',
+    path: '/unitree_h1/scene.xml',
     description: 'Advanced humanoid robot'
   }
 };
