@@ -1,11 +1,13 @@
 import * as THREE from 'three';
 import { MuJoCoModel, MuJoCoModule } from './types/mujoco';
 import { getQuaternion } from './mujoco-loader';
+import { Reflector } from './Reflector';
 
 export interface RobotGeometry {
   bodies: { [key: number]: THREE.Group };
-  groundPlane: THREE.Mesh | null;
+  groundPlane: THREE.Mesh | Reflector | null;
   mujocoRoot: THREE.Group;
+  lights: THREE.Light[];
 }
 
 export function buildRobotGeometry(
@@ -15,11 +17,12 @@ export function buildRobotGeometry(
 ): RobotGeometry {
   const bodies: { [key: number]: THREE.Group } = {};
   const meshes: { [key: number]: THREE.BufferGeometry } = {};
+  const lights: THREE.Light[] = [];
   const mujocoRoot = new THREE.Group();
   mujocoRoot.name = "MuJoCo Root";
   scene.add(mujocoRoot);
 
-  let groundPlane: THREE.Mesh | null = null;
+  let groundPlane: THREE.Mesh | Reflector | null = null;
 
   try {
     // Validate model before accessing properties
@@ -105,11 +108,26 @@ export function buildRobotGeometry(
       geometry = createGeometry(type, size);
     }
 
-    const material = createMaterial(type, model, g);
-    const mesh = new THREE.Mesh(geometry, material);
+    let mesh: THREE.Mesh | Reflector;
 
-    mesh.castShadow = true;
-    mesh.receiveShadow = type === 0;
+    if (type === 0) {
+      // Create reflective ground plane using Reflector
+      // Extract texture from model if available
+      const texture = extractTextureFromModel(model, g);
+      const planeGeometry = new THREE.PlaneGeometry(100, 100);
+      mesh = new Reflector(planeGeometry, {
+        texture: texture,
+        clipBias: 0.003
+      });
+      mesh.rotateX(-Math.PI / 2);
+      groundPlane = mesh;
+    } else {
+      // Create regular mesh for other geometries
+      const material = createMaterial(type, model, g);
+      mesh = new THREE.Mesh(geometry, material);
+      mesh.castShadow = true;
+      mesh.receiveShadow = true;
+    }
 
     // Set bodyID on the mesh for raycaster detection
     (mesh as THREE.Mesh & { bodyID?: number }).bodyID = b;
@@ -119,20 +137,72 @@ export function buildRobotGeometry(
     }
 
     // Position and orient the mesh
-    positionMesh(mesh, model, g, type);
-
-    if (type === 0) {
-      groundPlane = mesh;
+    if (type !== 0) {
+      positionMesh(mesh as THREE.Mesh, model, g, type);
+    } else {
+      // Position the ground plane
+      mesh.position.set(
+        model.geom_pos[(g * 3) + 0],
+        0,
+        -model.geom_pos[(g * 3) + 1]
+      );
     }
 
     bodies[b].add(mesh);
   }
 
-  return { bodies, groundPlane, mujocoRoot };
+  // Parse lights from the model
+  for (let l = 0; l < model.nlight; l++) {
+    let light: THREE.SpotLight | THREE.DirectionalLight;
+
+    if (model.light_directional[l]) {
+      light = new THREE.DirectionalLight();
+    } else {
+      const spotLight = new THREE.SpotLight();
+      spotLight.penumbra = 0.5;
+      spotLight.decay = model.light_attenuation[l] * 100;
+      light = spotLight;
+    }
+
+    light.castShadow = true;
+
+    // Shadow configuration
+    light.shadow.mapSize.width = 1024;
+    light.shadow.mapSize.height = 1024;
+    light.shadow.camera.near = 1;
+    light.shadow.camera.far = 10;
+
+    // Add light to world body (body 0) or mujocoRoot
+    if (bodies[0]) {
+      bodies[0].add(light);
+    } else {
+      mujocoRoot.add(light);
+    }
+
+    lights.push(light);
+  }
+
+  // Add a default directional light if no lights in model
+  if (model.nlight === 0) {
+    const light = new THREE.DirectionalLight();
+    mujocoRoot.add(light);
+    lights.push(light);
+  }
+
+  // Add all bodies to scene hierarchy
+  for (let b = 0; b < model.nbody; b++) {
+    if (b === 0 || !bodies[0]) {
+      mujocoRoot.add(bodies[b]);
+    } else if (bodies[b]) {
+      bodies[0].add(bodies[b]);
+    }
+  }
+
+  return { bodies, groundPlane, mujocoRoot, lights };
   } catch (error) {
     console.error('Error building robot geometry:', error);
     // Return empty geometry on error
-    return { bodies: {}, groundPlane: null, mujocoRoot };
+    return { bodies: {}, groundPlane: null, mujocoRoot, lights: [] };
   }
 }
 
@@ -153,7 +223,7 @@ function isValidMuJoCoModel(model: MuJoCoModel): boolean {
 function createGeometry(type: number, size: number[]): THREE.BufferGeometry {
   switch (type) {
     case 0: // Plane
-      return new THREE.PlaneGeometry(20, 20);
+      return new THREE.PlaneGeometry(100, 100); // Large plane for reflections
     case 2: // Sphere
       return new THREE.SphereGeometry(size[0]);
     case 3: // Capsule
@@ -167,6 +237,50 @@ function createGeometry(type: number, size: number[]): THREE.BufferGeometry {
   }
 }
 
+/**
+ * Extract texture from MuJoCo model for a specific geometry
+ * Matches mujoco_wasm texture extraction logic
+ */
+function extractTextureFromModel(model: MuJoCoModel, g: number): THREE.DataTexture | undefined {
+  // Check if geometry has a material
+  if (model.geom_matid[g] === -1) {
+    return undefined;
+  }
+
+  const matId = model.geom_matid[g];
+  const texId = model.mat_texid[matId];
+
+  if (texId === -1) {
+    return undefined;
+  }
+
+  // Extract texture data from model
+  const width = model.tex_width[texId];
+  const height = model.tex_height[texId];
+  const offset = model.tex_adr[texId];
+  const rgbArray = model.tex_rgb;
+  const rgbaArray = new Uint8Array(width * height * 4);
+
+  for (let p = 0; p < width * height; p++) {
+    rgbaArray[(p * 4) + 0] = rgbArray[offset + ((p * 3) + 0)];
+    rgbaArray[(p * 4) + 1] = rgbArray[offset + ((p * 3) + 1)];
+    rgbaArray[(p * 4) + 2] = rgbArray[offset + ((p * 3) + 2)];
+    rgbaArray[(p * 4) + 3] = 255;
+  }
+
+  const texture = new THREE.DataTexture(rgbaArray, width, height, THREE.RGBAFormat, THREE.UnsignedByteType);
+
+  // For plane geometries (type 0), apply special texture settings matching mujoco_wasm
+  texture.repeat = new THREE.Vector2(100, 100);
+  texture.wrapS = THREE.RepeatWrapping;
+  texture.wrapT = THREE.RepeatWrapping;
+  texture.magFilter = THREE.NearestFilter;
+  texture.minFilter = THREE.NearestFilter;
+  texture.needsUpdate = true;
+
+  return texture;
+}
+
 function createMaterial(type: number, model: MuJoCoModel, g: number): THREE.MeshPhysicalMaterial {
   // Get color and material properties
   let color = [
@@ -176,7 +290,7 @@ function createMaterial(type: number, model: MuJoCoModel, g: number): THREE.Mesh
     model.geom_rgba[(g * 4) + 3]
   ];
 
-  let texture: THREE.DataTexture | undefined;
+  let texture: THREE.DataTexture | THREE.Texture | undefined;
 
   // Check if geometry has a material
   if (model.geom_matid[g] !== -1) {
@@ -214,19 +328,19 @@ function createMaterial(type: number, model: MuJoCoModel, g: number): THREE.Mesh
     }
   }
 
-  // Create material with enhanced properties for better lighting
+  // Note: Ground plane (type === 0) is now handled by Reflector, not regular material
+
+  // Create material with enhanced properties for robot parts (Classic MuJoCo style)
   const materialProps: THREE.MeshPhysicalMaterialParameters = {
     color: new THREE.Color(color[0], color[1], color[2]),
     transparent: color[3] < 1.0,
     opacity: color[3],
-    // Enhanced material properties for better lighting
-    metalness: model.geom_matid[g] !== -1 ? Math.min(model.mat_reflectance[model.geom_matid[g]] * 0.3, 0.2) : 0.1,
-    roughness: model.geom_matid[g] !== -1 ? Math.max(1.0 - model.mat_shininess[model.geom_matid[g]], 0.3) : 0.7,
-    clearcoat: 0.1,
-    clearcoatRoughness: 0.1,
-    // Add some emissive glow for better visibility
-    emissive: new THREE.Color(color[0] * 0.02, color[1] * 0.02, color[2] * 0.02),
-    emissiveIntensity: 0.1
+    // Classic MuJoCo material properties - slightly shiny
+    metalness: model.geom_matid[g] !== -1 ? Math.min(model.mat_reflectance[model.geom_matid[g]] * 0.4, 0.3) : 0.15,
+    roughness: model.geom_matid[g] !== -1 ? Math.max(1.0 - model.mat_shininess[model.geom_matid[g]], 0.4) : 0.6,
+    clearcoat: 0.15,
+    clearcoatRoughness: 0.3,
+    reflectivity: 0.5,
   };
 
   // Only add texture if it exists
@@ -234,17 +348,7 @@ function createMaterial(type: number, model: MuJoCoModel, g: number): THREE.Mesh
     materialProps.map = texture;
   }
 
-  const material = new THREE.MeshPhysicalMaterial(materialProps);
-
-  // Special handling for ground plane
-  if (type === 0) {
-    material.color.setHex(0x4a5568);
-    material.metalness = 0.0;
-    material.roughness = 0.8;
-    material.emissive.setHex(0x000000);
-  }
-
-  return material;
+  return new THREE.MeshPhysicalMaterial(materialProps);
 }
 
 function positionMesh(

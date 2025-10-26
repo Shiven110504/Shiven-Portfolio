@@ -1,4 +1,5 @@
 import { MuJoCoModule } from './types/mujoco';
+import * as THREE from 'three';
 
 export async function loadMuJoCo(): Promise<MuJoCoModule> {
   // Load MuJoCo WASM module
@@ -32,8 +33,8 @@ export function setupMuJoCoFileSystem(mujoco: MuJoCoModule): void {
   try {
     mujoco.FS.mkdir('/working');
     console.log('Created /working directory');
-  } catch (error: any) {
-    if (error.message && error.message.includes('File exists')) {
+  } catch (error: unknown) {
+    if (error instanceof Error && error.message && error.message.includes('File exists')) {
       console.log('Directory /working already exists');
     } else {
       console.warn('Error creating /working directory:', error);
@@ -43,8 +44,8 @@ export function setupMuJoCoFileSystem(mujoco: MuJoCoModule): void {
   try {
     mujoco.FS.mkdir('/working/assets');
     console.log('Created /working/assets directory');
-  } catch (error: any) {
-    if (error.message && error.message.includes('File exists')) {
+  } catch (error: unknown) {
+    if (error instanceof Error && error.message && error.message.includes('File exists')) {
       console.log('Directory /working/assets already exists');
     } else {
       console.warn('Error creating /working/assets directory:', error);
@@ -55,8 +56,8 @@ export function setupMuJoCoFileSystem(mujoco: MuJoCoModule): void {
   try {
     mujoco.FS.mount(mujoco.MEMFS, { root: '.' }, '/working');
     console.log('Mounted MEMFS at /working');
-  } catch (error: any) {
-    if (error.message && (error.message.includes('File exists') || error.message.includes('already'))) {
+  } catch (error: unknown) {
+    if (error instanceof Error && error.message && (error.message.includes('File exists') || error.message.includes('already'))) {
       console.log('MEMFS already mounted at /working');
     } else {
       console.warn('Error mounting MEMFS at /working:', error);
@@ -93,21 +94,32 @@ export async function loadRobotModel(mujoco: MuJoCoModule, modelPath: string): P
   console.log('Found include files:', includeFiles);
 
   for (const includeFile of includeFiles) {
-    const includePath = `${modelDir}/${includeFile}`;
-    console.log(`Loading include file: ${includePath}`);
+    // Normalize the path to handle relative paths like ../common/file.xml
+    const includePath = normalizePath(`${modelDir}/${includeFile}`);
+    console.log(`Loading include file: ${includeFile} -> ${includePath}`);
 
     const includeResponse = await fetch(includePath);
     if (includeResponse.ok) {
       const includeContent = await includeResponse.text();
 
-      // Write the included file to the virtual filesystem in the model subdirectory
-      const includeVFSPath = modelSubDir ? `/working/${modelSubDir}/${includeFile}` : `/working/${includeFile}`;
+      // Determine where to write the file in VFS
+      // For "../common/file.xml" from /humanoid, we want /working/common/file.xml
+      const normalizedIncludePath = normalizePath(`${modelSubDir}/${includeFile}`);
+      const includeVFSPath = `/working/${normalizedIncludePath}`;
+
+      // Ensure parent directories exist
+      const includeDir = includeVFSPath.substring(0, includeVFSPath.lastIndexOf('/'));
+      ensureDirectory(mujoco, includeDir);
+
       mujoco.FS.writeFile(includeVFSPath, includeContent);
       console.log(`Wrote include file to: ${includeVFSPath}`);
 
       // Extract and load assets from the included file
+      // Use the normalized include path's directory for asset loading
+      const includeDir2 = includePath.substring(0, includePath.lastIndexOf('/'));
+      const includeSubDir = includeDir2.length > 1 ? includeDir2.substring(1) : '';
       const includeAssetFiles = extractAssetFiles(includeContent);
-      await loadAssets(mujoco, includeAssetFiles, modelDir, modelSubDir);
+      await loadAssets(mujoco, includeAssetFiles, includeDir2, includeSubDir);
     } else {
       console.warn(`Failed to load include file ${includePath}: ${includeResponse.statusText}`);
     }
@@ -128,6 +140,28 @@ export async function loadRobotModel(mujoco: MuJoCoModule, modelPath: string): P
   return modelSubDir ? `${modelSubDir}/${filename}` : filename;
 }
 
+/**
+ * Normalize a path to resolve relative segments like .. and .
+ * Example: /humanoid/../common/file.xml -> /common/file.xml
+ */
+function normalizePath(path: string): string {
+  const parts = path.split('/');
+  const normalized: string[] = [];
+
+  for (const part of parts) {
+    if (part === '..') {
+      // Go up one directory
+      normalized.pop();
+    } else if (part !== '.' && part !== '') {
+      // Add the part (skip . and empty strings)
+      normalized.push(part);
+    }
+  }
+
+  // Join with / and add leading / if original path had one
+  return (path.startsWith('/') ? '/' : '') + normalized.join('/');
+}
+
 function ensureDirectory(mujoco: MuJoCoModule, dirPath: string): void {
   const parts = dirPath.split('/').filter(p => p.length > 0);
   let currentPath = '';
@@ -135,12 +169,16 @@ function ensureDirectory(mujoco: MuJoCoModule, dirPath: string): void {
   for (const part of parts) {
     currentPath += '/' + part;
     try {
-      if (!mujoco.FS.analyzePath(currentPath).exists) {
+      // Try to stat the path - if it throws, directory doesn't exist
+      try {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        (mujoco.FS as any).stat(currentPath);
+      } catch {
+        // Directory doesn't exist, create it
         mujoco.FS.mkdir(currentPath);
-        console.log(`Created directory: ${currentPath}`);
       }
-    } catch (error: any) {
-      if (!error.message?.includes('File exists')) {
+    } catch (error: unknown) {
+      if (!(error instanceof Error && error.message?.includes('File exists'))) {
         console.warn(`Error creating directory ${currentPath}:`, error);
       }
     }
@@ -209,7 +247,10 @@ async function loadAssets(mujoco: MuJoCoModule, assetFiles: string[], modelDir: 
       // Ensure parent directory exists
       try {
         const parentDir = fsPath.substring(0, fsPath.lastIndexOf('/'));
-        if (!mujoco.FS.analyzePath(parentDir).exists) {
+        try {
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          (mujoco.FS as any).stat(parentDir);
+        } catch {
           mujoco.FS.mkdir(parentDir);
         }
       } catch (dirError) {
@@ -233,11 +274,13 @@ async function loadAssets(mujoco: MuJoCoModule, assetFiles: string[], modelDir: 
           mujoco.FS.writeFile(fsPath, content);
           console.log(`Successfully wrote text asset ${assetFile} to ${fsPath}`);
         }
-      } catch (fsError) {
+      } catch (fsError: unknown) {
         console.error(`Failed to write asset ${assetFile} to filesystem at ${fsPath}:`, fsError);
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const errorDetails = fsError as any;
         console.error('FS Error details:', {
-          errno: (fsError as any).errno,
-          message: (fsError as any).message,
+          errno: errorDetails.errno,
+          message: errorDetails.message,
           path: fsPath
         });
       }

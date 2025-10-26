@@ -1,3 +1,4 @@
+/* eslint-disable */
 // Type definitions for Emscripten 1.39.16
 // Project: https://emscripten.org
 // Definitions by: Kensuke Matsuzaki <https://github.com/zakki>

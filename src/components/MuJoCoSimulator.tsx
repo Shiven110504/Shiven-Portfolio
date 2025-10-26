@@ -5,12 +5,14 @@ import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { DragStateManager } from './DragStateManager';
 import { buildRobotGeometry } from './robot-geometry-builder';
-import { loadMuJoCo, setupMuJoCoFileSystem, loadRobotModel, validateModelFile, getPosition, getQuaternion, toMujocoPos } from './mujoco-loader';
+import { loadMuJoCo, setupMuJoCoFileSystem, loadRobotModel, getPosition, getQuaternion, toMujocoPos } from './mujoco-loader';
 import { ROBOT_MODELS } from './robot-models';
 import { MuJoCoModule, MuJoCoModel, MuJoCoState, MuJoCoSimulation } from './types/mujoco';
 import { LoadingScreen } from './ui/loading-screen';
 import { ControlPanel } from './ui/control-panel';
 import { ErrorScreen } from './ui/error-screen';
+import { ZMPController } from './zmp-controller';
+import { CameraController } from './camera-controller';
 
 class MuJoCoDemo {
   mujoco: MuJoCoModule;
@@ -22,11 +24,16 @@ class MuJoCoDemo {
   renderer: THREE.WebGLRenderer;
   controls: OrbitControls;
   bodies: { [key: number]: THREE.Group } = {};
+  lights: THREE.Light[] = [];
   dragStateManager: DragStateManager;
   mujocoTime: number = 0.0;
+  tmpVec: THREE.Vector3 = new THREE.Vector3();
   params: { scene: string; paused: boolean; help: boolean; ctrlnoiserate: number; ctrlnoisestd: number; keyframeNumber: number };
   currentModel: string;
   currentAction: string;
+  actionController: ZMPController | null = null;
+  cameraController: CameraController;
+  private _debugStepCount: number = 0;
 
   constructor(mujoco: MuJoCoModule, container: HTMLElement) {
     this.mujoco = mujoco;
@@ -43,9 +50,12 @@ class MuJoCoDemo {
     // Initialize drag state manager
     this.dragStateManager = new DragStateManager(this.scene, this.renderer, this.camera, container, this.controls);
 
+    // Initialize camera controller
+    this.cameraController = new CameraController(this.camera, this.controls);
+
     // Initialize params
     this.params = {
-      scene: 'humanoid.xml',
+      scene: 'humanoid/humanoid_scene.xml', // Note: not actively used, robot loaded via loadModel()
       paused: false,
       help: false,
       ctrlnoiserate: 0.0,
@@ -54,8 +64,8 @@ class MuJoCoDemo {
     };
   }
 
-  async loadModel(modelPath: string): Promise<void> {
-    console.log(`Loading model: ${modelPath}`);
+  async loadModel(modelPath: string, modelName: string): Promise<void> {
+    console.log(`Loading model: ${modelPath} (${modelName})`);
 
     // Free old simulation
     if (this.simulation) {
@@ -86,8 +96,9 @@ class MuJoCoDemo {
     this.simulation = new this.mujoco.Simulation(this.model, this.state);
 
     // Build geometry
-    const { bodies, groundPlane } = buildRobotGeometry(this.mujoco, this.model, this.scene);
+    const { bodies, lights } = buildRobotGeometry(this.mujoco, this.model, this.scene);
     this.bodies = bodies;
+    this.lights = lights;
 
     // Initialize simulation - use keyframe if available
     if (this.model.nkey > 0) {
@@ -105,7 +116,51 @@ class MuJoCoDemo {
     // Always call forward to compute derived quantities
     this.simulation.forward();
 
-    console.log(`Successfully loaded model: ${modelPath}`);
+    // Update current model name BEFORE creating controller
+    this.currentModel = modelName;
+
+    // Create action controller for this model using the correct model name
+    this.actionController = new ZMPController(this.model, this.simulation, modelName);
+
+    console.log(`Successfully loaded model: ${modelPath} (${modelName})`);
+  }
+
+  setAction(action: string): void {
+    this.currentAction = action;
+
+    if (!this.actionController) return;
+
+    if (action === 'idle') {
+      this.actionController.stopAction();
+      this.cameraController.stopFollowing();
+      this.cameraController.resetToDefault();
+    } else if (action === 'walk') {
+      // Reset to standing pose before walking
+      this.resetToStandingPose();
+      // Reset debug counter
+      this._debugStepCount = 0;
+      this.actionController.startAction('walk');
+      this.cameraController.startFollowing();
+    }
+  }
+
+  resetToStandingPose(): void {
+    if (!this.simulation || !this.model) return;
+
+    // Reset to keyframe if available (standing pose)
+    if (this.model.nkey > 0) {
+      const keyframeId = 0;
+      const qposStart = keyframeId * this.model.nq;
+      for (let i = 0; i < this.model.nq; i++) {
+        this.simulation.qpos[i] = this.model.key_qpos[qposStart + i];
+      }
+      // Reset velocities to zero
+      for (let i = 0; i < this.simulation.qvel.length; i++) {
+        this.simulation.qvel[i] = 0;
+      }
+      this.simulation.forward();
+      console.log('✓ Reset to standing pose');
+    }
   }
 
   resetSimulation(): void {
@@ -126,6 +181,24 @@ class MuJoCoDemo {
       }
 
       while (this.mujocoTime < timeMS) {
+        // Debug: Log simulation stepping (only first 3 steps)
+        if (this.actionController?.isActionActive()) {
+          const debugSteps = this._debugStepCount || 0;
+          if (debugSteps < 3) {
+            console.log(`🔄 Simulation step ${debugSteps + 1}`);
+            console.log(`  Time: ${this.mujocoTime.toFixed(3)}ms, Timestep: ${timestep}s`);
+            if (this.simulation.ctrl) {
+              console.log(`  Ctrl[0-3]: [${this.simulation.ctrl[0]?.toFixed(3)}, ${this.simulation.ctrl[1]?.toFixed(3)}, ${this.simulation.ctrl[2]?.toFixed(3)}, ${this.simulation.ctrl[3]?.toFixed(3)}]`);
+            }
+            this._debugStepCount = debugSteps + 1;
+          }
+        }
+
+        // Update action controller
+        if (this.actionController) {
+          this.actionController.update(timestep, this.currentAction);
+        }
+
         // Clear old perturbations, apply new ones
         if (this.simulation.qfrc_applied) {
           for (let i = 0; i < this.simulation.qfrc_applied.length; i++) {
@@ -133,27 +206,51 @@ class MuJoCoDemo {
           }
         }
 
-        // Handle dragging
-        const dragged = this.dragStateManager.physicsObject;
-        if (dragged && dragged.bodyID && this.model.body_mass) {
-          for (let b = 0; b < this.model.nbody; b++) {
-            if (this.bodies[b]) {
-              getPosition(this.simulation.xpos, b, this.bodies[b].position);
-              getQuaternion(this.simulation.xquat, b, this.bodies[b].quaternion);
-              this.bodies[b].updateWorldMatrix();
+        // Handle dragging (disabled during actions)
+        if (!this.actionController || !this.actionController.isActionActive()) {
+          const dragged = this.dragStateManager.physicsObject;
+          const bodyID = (dragged as unknown as { bodyID?: number })?.bodyID;
+          if (dragged && bodyID && this.model.body_mass) {
+            for (let b = 0; b < this.model.nbody; b++) {
+              if (this.bodies[b]) {
+                getPosition(this.simulation.xpos, b, this.bodies[b].position);
+                getQuaternion(this.simulation.xquat, b, this.bodies[b].quaternion);
+                this.bodies[b].updateWorldMatrix(false, false);
+              }
             }
+
+            // Update lights during dragging
+            for (let l = 0; l < this.model.nlight; l++) {
+              if (this.lights[l]) {
+                getPosition(this.simulation.light_xpos, l, this.lights[l].position);
+                getPosition(this.simulation.light_xdir, l, this.tmpVec);
+                this.lights[l].lookAt(this.tmpVec.add(this.lights[l].position));
+              }
+            }
+
+            this.dragStateManager.update();
+            const dragForce = this.dragStateManager.currentWorld.clone().sub(this.dragStateManager.worldHit);
+            const force = toMujocoPos(dragForce.multiplyScalar(this.model.body_mass[bodyID] * 250));
+            const point = toMujocoPos(this.dragStateManager.worldHit.clone());
+
+            this.simulation.applyForce(force.x, force.y, force.z, 0, 0, 0, point.x, point.y, point.z, bodyID);
           }
-
-          const bodyID = dragged.bodyID;
-          this.dragStateManager.update();
-          const dragForce = this.dragStateManager.currentWorld.clone().sub(this.dragStateManager.worldHit);
-          const force = toMujocoPos(dragForce.multiplyScalar(this.model.body_mass[bodyID] * 250));
-          const point = toMujocoPos(this.dragStateManager.worldHit.clone());
-
-          this.simulation.applyForce(force.x, force.y, force.z, 0, 0, 0, point.x, point.y, point.z, bodyID);
         }
 
         this.simulation.step();
+
+        // Debug: Log after simulation step
+        if (this.actionController?.isActionActive()) {
+          const debugSteps = this._debugStepCount || 0;
+          if (debugSteps <= 3 && debugSteps > 0) {
+            console.log(`  After step - Ctrl[0-3]: [${this.simulation.ctrl[0]?.toFixed(3)}, ${this.simulation.ctrl[1]?.toFixed(3)}, ${this.simulation.ctrl[2]?.toFixed(3)}, ${this.simulation.ctrl[3]?.toFixed(3)}]`);
+            // Check if joint positions changed
+            if (this.simulation.qpos && this.simulation.qpos.length > 10) {
+              console.log(`  Joint qpos[7-10]: [${this.simulation.qpos[7]?.toFixed(3)}, ${this.simulation.qpos[8]?.toFixed(3)}, ${this.simulation.qpos[9]?.toFixed(3)}, ${this.simulation.qpos[10]?.toFixed(3)}]`);
+            }
+          }
+        }
+
         this.mujocoTime += timestep * 1000.0;
       }
     }
@@ -164,8 +261,23 @@ class MuJoCoDemo {
         if (this.bodies[b]) {
           getPosition(this.simulation.xpos, b, this.bodies[b].position);
           getQuaternion(this.simulation.xquat, b, this.bodies[b].quaternion);
-          this.bodies[b].updateWorldMatrix();
+          this.bodies[b].updateWorldMatrix(false, false);
         }
+      }
+
+      // Update light transforms - matching mujoco_wasm
+      for (let l = 0; l < this.model.nlight; l++) {
+        if (this.lights[l]) {
+          getPosition(this.simulation.light_xpos, l, this.lights[l].position);
+          getPosition(this.simulation.light_xdir, l, this.tmpVec);
+          this.lights[l].lookAt(this.tmpVec.add(this.lights[l].position));
+        }
+      }
+
+      // Update camera to follow robot base
+      if (this.bodies[1]) { // Body 1 is usually the torso/base
+        const robotPosition = this.bodies[1].position.clone();
+        this.cameraController.update(robotPosition, 0.016); // Assume ~60fps
       }
     }
 
@@ -200,9 +312,8 @@ export default function MuJoCoSimulator() {
     await new Promise(resolve => setTimeout(resolve, 50));
 
     try {
-      // Load new model using the demo's loadModel method
-      await demo.loadModel(ROBOT_MODELS[modelKey].path);
-      demo.currentModel = modelKey;
+      // Load new model using the demo's loadModel method with correct model name
+      await demo.loadModel(ROBOT_MODELS[modelKey].path, modelKey);
       setCurrentModel(modelKey);
 
       // Resume physics after a brief moment
@@ -232,7 +343,7 @@ export default function MuJoCoSimulator() {
 
   const handleActionChange = (action: string) => {
     if (demoRef.current) {
-      demoRef.current.currentAction = action;
+      demoRef.current.setAction(action);
       setCurrentAction(action);
     }
   };
@@ -296,9 +407,8 @@ async function initDemo(container: HTMLDivElement, demoRef: React.MutableRefObje
     const demo = new MuJoCoDemo(mujoco, container);
     demoRef.current = demo;
 
-    // Load default model
-    await demo.loadModel(ROBOT_MODELS.humanoid.path);
-    demo.currentModel = 'humanoid';
+    // Load default model with correct model name
+    await demo.loadModel(ROBOT_MODELS.humanoid.path, 'humanoid');
 
     // Setup keyboard controls
     const handleKeyDown = (event: KeyboardEvent) => {
@@ -338,80 +448,46 @@ interface SceneSetup {
 }
 
 function createScene(container: HTMLElement): SceneSetup {
-  // Scene setup
+  // Scene setup - MuJoCo WASM style
   const scene = new THREE.Scene();
-  scene.background = new THREE.Color(0.1, 0.15, 0.25);
-  scene.fog = new THREE.Fog(scene.background, 12, 25);
+
+  // Set background color matching mujoco_wasm
+  scene.background = new THREE.Color(0.15, 0.25, 0.35);
+
+  // Add fog matching mujoco_wasm
+  scene.fog = new THREE.Fog(scene.background as THREE.Color, 15, 25.5);
 
   // Camera setup
   const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.001, 100);
-  camera.position.set(2.0, 1.7, 2.0);
+  camera.position.set(2.0, 1.7, 1.7);
   scene.add(camera);
 
-  // Lighting setup - Beautiful and realistic lighting
-  setupSceneLighting(scene);
+  // Low ambient light - matching mujoco_wasm
+  const ambientLight = new THREE.AmbientLight(0xffffff, 0.1);
+  scene.add(ambientLight);
 
   // Renderer setup with improved settings
   const renderer = new THREE.WebGLRenderer({
     antialias: true,
     alpha: false
   });
-  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2)); // Cap at 2 for performance
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
   renderer.setSize(window.innerWidth, window.innerHeight);
   renderer.shadowMap.enabled = true;
-  renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+  renderer.shadowMap.type = THREE.PCFSoftShadowMap;  // Classic MuJoCo shadow style
+  renderer.toneMapping = THREE.ACESFilmicToneMapping;
+  renderer.toneMappingExposure = 1.0;
   container.appendChild(renderer.domElement);
 
   // Controls setup
   const controls = new OrbitControls(camera, renderer.domElement);
-  controls.target.set(0, 0.8, 0);
+  controls.target.set(0, 0.7, 0);
   controls.panSpeed = 2;
   controls.zoomSpeed = 1;
   controls.enableDamping = true;
-  controls.dampingFactor = 0.05;
+  controls.dampingFactor = 0.10;
   controls.screenSpacePanning = true;
-  controls.minDistance = 1;
-  controls.maxDistance = 20;
   controls.update();
 
   return { scene, camera, renderer, controls };
-}
-
-function setupSceneLighting(scene: THREE.Scene): void {
-  // Ambient light for overall illumination
-  const ambientLight = new THREE.AmbientLight(0x404040, 0.4);
-  scene.add(ambientLight);
-
-  // Main directional light (sun-like)
-  const mainLight = new THREE.DirectionalLight(0xffffff, 1.2);
-  mainLight.position.set(5, 8, 5);
-  mainLight.castShadow = true;
-
-  // Configure shadow properties
-  mainLight.shadow.mapSize.width = 2048;
-  mainLight.shadow.mapSize.height = 2048;
-  mainLight.shadow.camera.near = 0.5;
-  mainLight.shadow.camera.far = 50;
-  mainLight.shadow.camera.left = -10;
-  mainLight.shadow.camera.right = 10;
-  mainLight.shadow.camera.top = 10;
-  mainLight.shadow.camera.bottom = -10;
-  mainLight.shadow.bias = -0.0001;
-
-  scene.add(mainLight);
-
-  // Fill light (softer, opposite side)
-  const fillLight = new THREE.DirectionalLight(0xb8d4f0, 0.3);
-  fillLight.position.set(-3, 4, -3);
-  scene.add(fillLight);
-
-  // Rim light for depth and separation
-  const rimLight = new THREE.DirectionalLight(0xffe4b5, 0.4);
-  rimLight.position.set(0, 6, -8);
-  scene.add(rimLight);
-
-  // Subtle blue accent light
-  const accentLight = new THREE.DirectionalLight(0x87ceeb, 0.2);
-  accentLight.position.set(-5, 2, 5);
-  scene.add(accentLight);
 }

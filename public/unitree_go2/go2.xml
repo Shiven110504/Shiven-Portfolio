@@ -62,6 +62,8 @@
 
   <worldbody>
     <body name="base" pos="0 0 0.445" childclass="go2">
+      <!-- Top light attached to base that tracks COM -->
+      <light name="top" pos="0 0 2" mode="trackcom"/>
       <inertial pos="0.021112 0 -0.005366" quat="-0.000543471 0.713435 -0.00173769 0.700719" mass="6.921"
         diaginertia="0.107027 0.0980771 0.0244531"/>
       <freejoint/>

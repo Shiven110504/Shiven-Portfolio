@@ -7,7 +7,7 @@ export interface RobotModel {
 export const ROBOT_MODELS: Record<string, RobotModel> = {
   humanoid: {
     name: 'Humanoid',
-    path: '/humanoid.xml',
+    path: '/humanoid/humanoid_scene.xml',
     description: 'Classic MuJoCo humanoid'
   },
   unitree_go2: {

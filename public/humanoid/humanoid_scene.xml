@@ -1,0 +1,18 @@
+<!-- Humanoid with shared environment -->
+<mujoco model="Humanoid Scene">
+  <!-- Include shared environment settings -->
+  <include file="../common/common_environment.xml"/>
+
+  <!-- Include humanoid robot definition -->
+  <include file="humanoid_robot.xml"/>
+
+  <statistic center="0 0 0.7"/>
+
+  <worldbody>
+    <!-- Floor plane with shared grid material -->
+    <geom name="floor" size="0 0 .05" type="plane" material="grid" condim="3"/>
+
+    <!-- Spotlight that follows the torso -->
+    <light name="spotlight" mode="targetbodycom" target="torso" diffuse=".8 .8 .8" specular="0.3 0.3 0.3" pos="0 -6 4" cutoff="30"/>
+  </worldbody>
+</mujoco>
