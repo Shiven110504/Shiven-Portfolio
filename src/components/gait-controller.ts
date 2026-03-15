@@ -32,19 +32,17 @@ interface JointConfig {
 /**
  * Simple walking controller using pure position actuator control
  */
-export class ZMPController {
+export class GaitController {
   private model: MuJoCoModel;
   private simulation: MuJoCoSimulation;
   private modelName: string;
   private phase: number = 0;
   private isActive: boolean = false;
-  private debugLogCount: number = 0;
 
-  // Actuator mapping
   private actuatorMap: ActuatorMap = {};
   private jointConfig: JointConfig;
-  private warnedActuators: Set<string> = new Set(); // Track which actuators we've warned about
-  private motorActuators: Set<string> = new Set(); // Motor actuators (need torque control)
+  private warnedActuators: Set<string> = new Set();
+  private motorActuators: Set<string> = new Set();
 
   constructor(model: MuJoCoModel, simulation: MuJoCoSimulation, modelName: string) {
     this.model = model;
@@ -69,12 +67,10 @@ export class ZMPController {
     this.motorActuators.clear();
 
     if (modelName === 'unitree_go2') {
-      // Go2 hip actuators are motors (empirically verified - they don't respond to position control)
       this.motorActuators.add('FL_hip');
       this.motorActuators.add('FR_hip');
       this.motorActuators.add('RL_hip');
       this.motorActuators.add('RR_hip');
-      console.log('🔧 Motor actuators (torque control):', Array.from(this.motorActuators).join(', '));
     }
   }
 
@@ -100,8 +96,6 @@ export class ZMPController {
       }
     }
 
-    const actuatorNames = Object.keys(this.actuatorMap);
-    console.log(`✓ ${this.modelName}: Found ${actuatorNames.length} actuators:`, actuatorNames);
   }
 
   /**
@@ -110,11 +104,7 @@ export class ZMPController {
   private getActuatorIndex(actuatorName: string): number | null {
     const index = this.actuatorMap[actuatorName];
     if (index === undefined) {
-      // Only warn once per actuator to avoid console spam
-      if (!this.warnedActuators.has(actuatorName)) {
-        console.warn(`⚠️ Actuator '${actuatorName}' not found in ${this.modelName} model`);
-        this.warnedActuators.add(actuatorName);
-      }
+      this.warnedActuators.add(actuatorName);
       return null;
     }
     return index;
@@ -167,8 +157,6 @@ export class ZMPController {
     if (action === 'walk') {
       this.isActive = true;
       this.phase = 0;
-      this.debugLogCount = 0;
-      console.log(`🚶 Starting simple walking for ${this.modelName}`);
     }
   }
 
@@ -271,56 +259,29 @@ export class ZMPController {
     // Generate simple gait targets
     const targets = this.generateSimpleGait(this.phase);
 
-    // Apply mixed control: torque for motors, position for servos
-    let appliedCount = 0;
     targets.forEach((targetAngle, actuatorName) => {
       const actuatorIdx = this.getActuatorIndex(actuatorName);
       if (actuatorIdx !== null && actuatorIdx < this.simulation.ctrl.length) {
         const isMotor = this.motorActuators.has(actuatorName);
 
         if (isMotor) {
-          // MOTOR actuator - apply PD control to calculate torque
           const trnId = this.model.actuator_trnid ? this.model.actuator_trnid[actuatorIdx * 2] : -1;
-
           if (trnId >= 0 && trnId < this.simulation.qpos.length) {
             const currentAngle = this.simulation.qpos[trnId];
-
-            // CRITICAL FIX: Free joint has 7 qpos elements but 6 qvel elements
-            // So qpos[7] corresponds to qvel[6], qpos[8] to qvel[7], etc.
-            // Correct formula: velIdx = trnId - 1
+            // Free joint has 7 qpos elements but 6 qvel elements; velIdx = trnId - 1
             const velIdx = trnId - 1;
             const currentVel = velIdx >= 0 && velIdx < this.simulation.qvel.length
               ? this.simulation.qvel[velIdx]
               : 0;
-
-            // PD control: torque = kp * error + kd * (-velocity)
             const error = targetAngle - currentAngle;
             const torque = PD_GAINS.kp * error + PD_GAINS.kd * (-currentVel);
-
             this.simulation.ctrl[actuatorIdx] = torque;
-
-            if (this.debugLogCount < 2) {
-              console.log(`  ⚙️ ${actuatorName} [${actuatorIdx}] MOTOR: target=${targetAngle.toFixed(3)}, current=${currentAngle.toFixed(3)}, error=${error.toFixed(3)}, torque=${torque.toFixed(3)}`);
-            }
           }
         } else {
-          // POSITION SERVO - direct position control
           this.simulation.ctrl[actuatorIdx] = targetAngle;
-
-          if (this.debugLogCount < 2) {
-            console.log(`  📍 ${actuatorName} [${actuatorIdx}] SERVO: target=${targetAngle.toFixed(3)}`);
-          }
         }
-
-        appliedCount++;
       }
     });
-
-    // Debug logging
-    if (this.debugLogCount < 2) {
-      console.log(`🎯 Step ${this.debugLogCount + 1}, Phase: ${this.phase.toFixed(3)}s, Applied: ${appliedCount}/${targets.size} actuators`);
-      this.debugLogCount++;
-    }
   }
 
   /**

@@ -11,7 +11,7 @@ import { MuJoCoModule, MuJoCoModel, MuJoCoState, MuJoCoSimulation } from './type
 import { LoadingScreen } from './ui/loading-screen';
 import { ControlPanel } from './ui/control-panel';
 import { ErrorScreen } from './ui/error-screen';
-import { ZMPController } from './zmp-controller';
+import { GaitController } from './gait-controller';
 import { CameraController } from './camera-controller';
 
 class MuJoCoDemo {
@@ -31,10 +31,8 @@ class MuJoCoDemo {
   params: { scene: string; paused: boolean; help: boolean; ctrlnoiserate: number; ctrlnoisestd: number; keyframeNumber: number };
   currentModel: string;
   currentAction: string;
-  actionController: ZMPController | null = null;
+  actionController: GaitController | null = null;
   cameraController: CameraController;
-  private _debugStepCount: number = 0;
-
   constructor(mujoco: MuJoCoModule, container: HTMLElement) {
     this.mujoco = mujoco;
     this.currentModel = 'humanoid';
@@ -65,7 +63,6 @@ class MuJoCoDemo {
   }
 
   async loadModel(modelPath: string, modelName: string): Promise<void> {
-    console.log(`Loading model: ${modelPath} (${modelName})`);
 
     // Free old simulation
     if (this.simulation) {
@@ -90,7 +87,6 @@ class MuJoCoDemo {
 
     // Create MuJoCo objects using the VFS path
     const fullVFSPath = `/working/${vfsPath}`;
-    console.log(`Loading MuJoCo model from VFS path: ${fullVFSPath}`);
     this.model = this.mujoco.Model.load_from_xml(fullVFSPath);
     this.state = new this.mujoco.State(this.model);
     this.simulation = new this.mujoco.Simulation(this.model, this.state);
@@ -102,27 +98,18 @@ class MuJoCoDemo {
 
     // Initialize simulation - use keyframe if available
     if (this.model.nkey > 0) {
-      // Copy keyframe data to qpos
-      const keyframeId = 0; // Use first keyframe
+      const keyframeId = 0;
       const qposStart = keyframeId * this.model.nq;
       for (let i = 0; i < this.model.nq; i++) {
         this.simulation.qpos[i] = this.model.key_qpos[qposStart + i];
       }
-      console.log(`Initialized with keyframe 0, nq=${this.model.nq}`);
-    } else {
-      console.log(`No keyframes available, using default initialization`);
     }
 
     // Always call forward to compute derived quantities
     this.simulation.forward();
 
-    // Update current model name BEFORE creating controller
     this.currentModel = modelName;
-
-    // Create action controller for this model using the correct model name
-    this.actionController = new ZMPController(this.model, this.simulation, modelName);
-
-    console.log(`Successfully loaded model: ${modelPath} (${modelName})`);
+    this.actionController = new GaitController(this.model, this.simulation, modelName);
   }
 
   setAction(action: string): void {
@@ -135,10 +122,7 @@ class MuJoCoDemo {
       this.cameraController.stopFollowing();
       this.cameraController.resetToDefault();
     } else if (action === 'walk') {
-      // Reset to standing pose before walking
       this.resetToStandingPose();
-      // Reset debug counter
-      this._debugStepCount = 0;
       this.actionController.startAction('walk');
       this.cameraController.startFollowing();
     }
@@ -154,12 +138,10 @@ class MuJoCoDemo {
       for (let i = 0; i < this.model.nq; i++) {
         this.simulation.qpos[i] = this.model.key_qpos[qposStart + i];
       }
-      // Reset velocities to zero
       for (let i = 0; i < this.simulation.qvel.length; i++) {
         this.simulation.qvel[i] = 0;
       }
       this.simulation.forward();
-      console.log('✓ Reset to standing pose');
     }
   }
 
@@ -181,20 +163,6 @@ class MuJoCoDemo {
       }
 
       while (this.mujocoTime < timeMS) {
-        // Debug: Log simulation stepping (only first 3 steps)
-        if (this.actionController?.isActionActive()) {
-          const debugSteps = this._debugStepCount || 0;
-          if (debugSteps < 3) {
-            console.log(`🔄 Simulation step ${debugSteps + 1}`);
-            console.log(`  Time: ${this.mujocoTime.toFixed(3)}ms, Timestep: ${timestep}s`);
-            if (this.simulation.ctrl) {
-              console.log(`  Ctrl[0-3]: [${this.simulation.ctrl[0]?.toFixed(3)}, ${this.simulation.ctrl[1]?.toFixed(3)}, ${this.simulation.ctrl[2]?.toFixed(3)}, ${this.simulation.ctrl[3]?.toFixed(3)}]`);
-            }
-            this._debugStepCount = debugSteps + 1;
-          }
-        }
-
-        // Update action controller
         if (this.actionController) {
           this.actionController.update(timestep, this.currentAction);
         }
@@ -219,7 +187,6 @@ class MuJoCoDemo {
               }
             }
 
-            // Update lights during dragging
             for (let l = 0; l < this.model.nlight; l++) {
               if (this.lights[l]) {
                 getPosition(this.simulation.light_xpos, l, this.lights[l].position);
@@ -238,19 +205,6 @@ class MuJoCoDemo {
         }
 
         this.simulation.step();
-
-        // Debug: Log after simulation step
-        if (this.actionController?.isActionActive()) {
-          const debugSteps = this._debugStepCount || 0;
-          if (debugSteps <= 3 && debugSteps > 0) {
-            console.log(`  After step - Ctrl[0-3]: [${this.simulation.ctrl[0]?.toFixed(3)}, ${this.simulation.ctrl[1]?.toFixed(3)}, ${this.simulation.ctrl[2]?.toFixed(3)}, ${this.simulation.ctrl[3]?.toFixed(3)}]`);
-            // Check if joint positions changed
-            if (this.simulation.qpos && this.simulation.qpos.length > 10) {
-              console.log(`  Joint qpos[7-10]: [${this.simulation.qpos[7]?.toFixed(3)}, ${this.simulation.qpos[8]?.toFixed(3)}, ${this.simulation.qpos[9]?.toFixed(3)}, ${this.simulation.qpos[10]?.toFixed(3)}]`);
-            }
-          }
-        }
-
         this.mujocoTime += timestep * 1000.0;
       }
     }
@@ -301,8 +255,6 @@ export default function MuJoCoSimulator() {
       throw new Error(`Invalid model key: ${modelKey}`);
     }
 
-    console.log(`Switching to model: ${modelKey}`);
-
     // Pause physics during transition
     demo.params.paused = true;
     setPhysicsPaused(true);
@@ -316,12 +268,9 @@ export default function MuJoCoSimulator() {
       await demo.loadModel(ROBOT_MODELS[modelKey].path, modelKey);
       setCurrentModel(modelKey);
 
-      // Resume physics after a brief moment
       await new Promise(resolve => setTimeout(resolve, 100));
       demo.params.paused = false;
       setPhysicsPaused(false);
-
-      console.log(`Successfully switched to ${modelKey}`);
     } catch (error) {
       console.error('Error switching model:', error);
       throw error;

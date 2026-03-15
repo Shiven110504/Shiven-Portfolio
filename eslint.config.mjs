@@ -18,6 +18,9 @@ const eslintConfig = [
       "out/**",
       "build/**",
       "next-env.d.ts",
+      // Vendor WASM files — auto-generated, not authored code
+      "public/mujoco_wasm.js",
+      "public/mujoco_wasm.d.ts",
     ],
   },
 ];
